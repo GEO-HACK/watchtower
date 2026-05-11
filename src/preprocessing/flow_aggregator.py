@@ -167,6 +167,9 @@ class Flow:
             'src_port':  self.src_port,
             'dst_port':  self.dst_port,
             'protocol':  self.protocol,
+            # Timing identity
+            'start_time': self.start_time,
+            'end_time': self.last_seen,
 
             # Temporal
             'flow_duration':    duration,
