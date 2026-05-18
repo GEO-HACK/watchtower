@@ -6,13 +6,24 @@ import logging
 import numpy as np
 import pandas as pd
 
-from preprocessing.packet_capture import capture_from_pcap, get_packet_metadata, save_packets_for_flows
 from preprocessing.flow_aggregator import FlowAggregator
 from diagnostics.schema_checker import inspect_model_file, align_columns
 from sklearn.metrics import classification_report, accuracy_score, f1_score
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+LABEL_CANDIDATES = [
+    'label',
+    'Label',
+    'class',
+    'Class',
+    'attack',
+    'Attack',
+    'target',
+    'Target',
+    'y',
+]
 
 
 def load_maybe_dict_model(path):
@@ -40,6 +51,8 @@ def predict_with_model(model, X):
 
 def pcap_to_flow_features(pcap_path, max_packets=None, skip_packets=0):
     """Read a PCAP file and return a pandas.DataFrame of flow feature dicts."""
+    from preprocessing.packet_capture import capture_from_pcap, get_packet_metadata
+
     aggregator = FlowAggregator()
 
     def handle_packet(packet):
@@ -59,6 +72,25 @@ def pcap_to_flow_features(pcap_path, max_packets=None, skip_packets=0):
         return pd.DataFrame()
     df = pd.DataFrame(flows)
     return df
+
+
+def csv_to_flow_features(csv_path):
+    """Read a CSV capture file and return features plus optional labels.
+
+    The CSV may already contain aggregated flow features. If a label-like column
+    is present, it will be extracted and returned separately.
+    """
+    df = pd.read_csv(csv_path)
+    if df.empty:
+        raise ValueError(f'CSV capture is empty: {csv_path}')
+
+    label_col = next((col for col in LABEL_CANDIDATES if col in df.columns), None)
+    y_test = None
+    if label_col is not None:
+        y_test = pd.to_numeric(df[label_col], errors='coerce').fillna(0).to_numpy()
+        df = df.drop(columns=[label_col])
+
+    return df, y_test
 
 
 def align_and_transform(df, model_info, pipeline_path=None):
@@ -139,10 +171,12 @@ def combine_predictions(preds1, preds2, proba1=None, proba2=None, strategy="majo
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Run hybrid detection on flow features extracted from a PCAP')
-    parser.add_argument('--pcap', default=os.path.join('src', 'data', 'Friday-WorkingHours.pcap'), help='Path to input PCAP file')
+    parser = argparse.ArgumentParser(description='Run hybrid detection on flow features extracted from a PCAP or CSV capture file')
+    parser.add_argument('--capture-file', '--pcap', dest='capture_file', default=os.path.join('src', 'data', 'live_stream.csv'), help='Path to input capture file (.pcap or .csv)')
+    parser.add_argument('--capture-format', choices=['auto', 'pcap', 'csv'], default='auto', help='Override capture file type detection')
     parser.add_argument('--max-packets', type=int, default=1000, help='Process only this many packets from the PCAP for faster testing (default: 1000)')
     parser.add_argument('--skip-packets', type=int, default=0, help='Skip this many initial packets before processing')
+    parser.add_argument('--y-test', default=None, help='Optional path to labels for CSV capture files')
     parser.add_argument('--export-misclassified', default=None, help='Directory to write per-flow PCAPs for misclassified flows')
     parser.add_argument('--export-which', choices=['model1','model2','fused'], default='model1', help='Which predictions to consider when exporting misclassified flows')
     parser.add_argument('--pad-seconds', type=float, default=0.5, help='Seconds to pad flow time window when exporting packets')
@@ -157,36 +191,63 @@ def main():
         sys.exit(1)
 
     # Setup paths
-    pcap_path = args.pcap
+    capture_path = args.capture_file
     model1_path = os.path.join('src', 'models', 'random_forest.pkl')
     model2_path = os.path.join('src', 'models', 'xgboost_model.pkl')
     pipeline_path = os.path.join('src', 'models', 'preprocessing_pipeline.pkl')
     y_test_path = os.path.join('src', 'data', 'y_test.npy')
 
-    # Check if y_test exists (with possible space in filename)
-    y_test = None
-    if not os.path.exists(y_test_path):
-        alt_y_test_path = os.path.join('src', 'data', 'y_test .npy')
-        if os.path.exists(alt_y_test_path):
-            y_test_path = alt_y_test_path
+    if not os.path.exists(capture_path):
+        logger.error('Capture file not found: %s', capture_path)
+        sys.exit(1)
 
-    if os.path.exists(y_test_path):
-        y_test = np.load(y_test_path)
-        logger.info('Loaded ground truth labels: %d samples', len(y_test))
+    if args.capture_format == 'auto':
+        capture_format = 'csv' if capture_path.lower().endswith('.csv') else 'pcap'
     else:
-        logger.warning('No ground truth labels found; will show predictions only')
+        capture_format = args.capture_format
 
-    # Convert PCAP to flows
-    logger.info(
-        'Converting PCAP to flows (skip=%d, max=%s)...',
-        args.skip_packets,
-        str(args.max_packets) if args.max_packets is not None else 'all',
-    )
-    df = pcap_to_flow_features(
-        pcap_path,
-        max_packets=args.max_packets,
-        skip_packets=args.skip_packets,
-    )
+    # Convert capture file to flows/features
+    y_test = None
+    if capture_format == 'csv':
+        logger.info('Loading flow features from CSV: %s', capture_path)
+        df, embedded_y = csv_to_flow_features(capture_path)
+        if args.y_test is not None:
+            y_test_path = args.y_test
+            if os.path.exists(y_test_path):
+                y_test = np.load(y_test_path)
+                logger.info('Loaded ground truth labels from %s: %d samples', y_test_path, len(y_test))
+            else:
+                logger.warning('Provided y_test file not found: %s', y_test_path)
+        elif embedded_y is not None:
+            y_test = embedded_y
+            logger.info('Loaded labels from CSV capture file: %d samples', len(y_test))
+        else:
+            logger.warning('CSV capture has no labels; will show predictions only')
+    else:
+        # Check if y_test exists (with possible space in filename)
+        if args.y_test is not None:
+            y_test_path = args.y_test
+        elif not os.path.exists(y_test_path):
+            alt_y_test_path = os.path.join('src', 'data', 'y_test .npy')
+            if os.path.exists(alt_y_test_path):
+                y_test_path = alt_y_test_path
+
+        if os.path.exists(y_test_path):
+            y_test = np.load(y_test_path)
+            logger.info('Loaded ground truth labels: %d samples', len(y_test))
+        else:
+            logger.warning('No ground truth labels found; will show predictions only')
+
+        logger.info(
+            'Converting PCAP to flows (skip=%d, max=%s)...',
+            args.skip_packets,
+            str(args.max_packets) if args.max_packets is not None else 'all',
+        )
+        df = pcap_to_flow_features(
+            capture_path,
+            max_packets=args.max_packets,
+            skip_packets=args.skip_packets,
+        )
     logger.info('Flows generated: %d', len(df))
 
     if df.empty:
@@ -233,9 +294,13 @@ def main():
 
     # Optionally export misclassified flows to PCAPs
     if args.export_misclassified:
-        if y_test is None:
+        if capture_format == 'csv':
+            logger.warning('Misclassified flow export is only available for PCAP input; skipping export')
+        elif y_test is None:
             logger.error('Cannot export misclassified flows: ground truth (y_test) not available')
         else:
+            from preprocessing.packet_capture import save_packets_for_flows
+
             # choose prediction vector
             if args.export_which == 'model1':
                 chosen_preds = preds1
@@ -256,9 +321,9 @@ def main():
 
     # Display results
     print("\n" + "="*80)
-    print("HYBRID DETECTOR: FRIDAY-WORKINGHOURS PCAP ANALYSIS")
+    print("HYBRID DETECTOR: FLOW ANALYSIS")
     print("="*80)
-    print(f"\nDataset: {len(df)} flows extracted from Friday-WorkingHours.pcap")
+    print(f"\nDataset: {len(df)} flows extracted from {os.path.basename(capture_path)}")
     print(f"Features: {X.shape[1]} aligned features")
 
     print("\n" + "-"*80)

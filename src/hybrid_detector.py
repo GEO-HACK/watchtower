@@ -3,6 +3,7 @@ import os
 import sys
 import joblib
 import numpy as np
+import pandas as pd
 from sklearn.metrics import classification_report, accuracy_score, f1_score
 
 # Import diagnostics utilities
@@ -41,6 +42,7 @@ def validate_schema_compatibility(model1_info, model2_info, data_shape):
         (is_compatible: bool, warnings: list, expected_n_features: int)
     """
     warnings = []
+    fatal = False
     n1 = model1_info.get('n_features_in_')
     n2 = model2_info.get('n_features_in_')
     n_actual = data_shape[1] if len(data_shape) > 1 else None
@@ -51,13 +53,14 @@ def validate_schema_compatibility(model1_info, model2_info, data_shape):
     else:
         if n1 != n2:
             warnings.append(f"CRITICAL: Model feature mismatch! Model1 expects {n1} features, Model2 expects {n2}. Retrain one model.")
+            fatal = True
             return False, warnings, None
         expected_n = n1
     
     if n_actual is not None and expected_n is not None and n_actual != expected_n:
         warnings.append(f"Data feature count ({n_actual}) != expected ({expected_n}). Alignment may be needed.")
     
-    return len(warnings) == 0, warnings, expected_n
+    return (not fatal), warnings, expected_n
 
 
 def combine_predictions(preds1, preds2, proba1=None, proba2=None, strategy="majority"):
@@ -115,6 +118,22 @@ def combine_predictions(preds1, preds2, proba1=None, proba2=None, strategy="majo
     return np.array(combined)
 
 
+def load_live_csv_features(csv_path):
+    """Load live stream CSV and return numeric feature matrix plus preview dataframe."""
+    df = pd.read_csv(csv_path)
+    if df.empty:
+        raise ValueError(f"Live CSV is empty: {csv_path}")
+
+    preview_cols = ["src_ip", "dst_ip", "src_port", "dst_port", "protocol", "timestamp"]
+    available_preview = [c for c in preview_cols if c in df.columns]
+    preview_df = df[available_preview].copy() if available_preview else pd.DataFrame(index=df.index)
+
+    drop_cols = ["src_ip", "dst_ip", "timestamp"]
+    feature_df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
+    feature_df = feature_df.apply(pd.to_numeric, errors="coerce").fillna(0)
+    return feature_df.to_numpy(), preview_df
+
+
 def main():
     p = argparse.ArgumentParser(description="Hybrid detector combining two saved models (unified feature schema)")
     p.add_argument("--models_dir", default="./src/models", help="Directory where models live (local)")
@@ -124,6 +143,8 @@ def main():
     p.add_argument("--pipeline", default=None, help="Path to preprocessing pipeline (joblib)")
     p.add_argument("--x_test", default=None, help="Path to X_test (.npy)")
     p.add_argument("--y_test", default=None, help="Path to y_test (.npy)")
+    p.add_argument("--live_csv", default=None, help="Path to live stream CSV (e.g., src/data/live_stream.csv)")
+    p.add_argument("--top", type=int, default=10, help="Number of sample rows to print for live CSV mode")
     p.add_argument("--strategy", choices=["majority","or","avg_proba","confidence_weighted","unanimous_or_majority"], default="majority", help="Fusion strategy")
     args = p.parse_args()
 
@@ -154,17 +175,28 @@ def main():
         except Exception as e:
             print(f"[Preprocessing] Could not load pipeline: {e}")
 
-    if not os.path.exists(x_test_path) or not os.path.exists(y_test_path):
-        # Check for y_test with space in filename
-        alt_y_test_path = os.path.join(data_dir, "y_test .npy")
-        if os.path.exists(x_test_path) and os.path.exists(alt_y_test_path):
-            y_test_path = alt_y_test_path
-        else:
-            raise FileNotFoundError(f"Missing test arrays at {x_test_path} or {y_test_path}")
+    live_mode = args.live_csv is not None
+    live_preview = None
 
-    X_test = np.load(x_test_path)
-    y_test = np.load(y_test_path)
-    print(f"\n[Data] X_test shape: {X_test.shape}, y_test shape: {y_test.shape}")
+    if live_mode:
+        if not os.path.exists(args.live_csv):
+            raise FileNotFoundError(f"Live CSV not found: {args.live_csv}")
+        X_test, live_preview = load_live_csv_features(args.live_csv)
+        y_test = None
+        print(f"\n[Data] Live CSV mode: {args.live_csv}")
+        print(f"[Data] X_live shape: {X_test.shape}")
+    else:
+        if not os.path.exists(x_test_path) or not os.path.exists(y_test_path):
+            # Check for y_test with space in filename
+            alt_y_test_path = os.path.join(data_dir, "y_test .npy")
+            if os.path.exists(x_test_path) and os.path.exists(alt_y_test_path):
+                y_test_path = alt_y_test_path
+            else:
+                raise FileNotFoundError(f"Missing test arrays at {x_test_path} or {y_test_path}")
+
+        X_test = np.load(x_test_path)
+        y_test = np.load(y_test_path)
+        print(f"\n[Data] X_test shape: {X_test.shape}, y_test shape: {y_test.shape}")
 
     # Validate schema compatibility between models
     is_compatible, schema_warnings, expected_n = validate_schema_compatibility(model1_info, model2_info, X_test.shape)
@@ -203,6 +235,46 @@ def main():
     preds2, proba2 = predict_with_model(m2, X_for_m2)
 
     combined = combine_predictions(preds1, preds2, proba1, proba2, strategy=args.strategy)
+
+    if live_mode:
+        print("\n" + "=" * 70)
+        print(f"LIVE STREAM RESULTS (Fusion Strategy: {args.strategy})")
+        print("=" * 70)
+
+        def show_dist(name, arr):
+            labels, counts = np.unique(arr, return_counts=True)
+            print(f"\n[{name}] Prediction distribution:")
+            for lbl, cnt in zip(labels, counts):
+                pct = (cnt / len(arr)) * 100
+                print(f"  Class {int(lbl)}: {int(cnt)} ({pct:.2f}%)")
+
+        show_dist("Model 1", preds1)
+        show_dist("Model 2", preds2)
+        show_dist("Fused", combined)
+
+        agreement = np.mean(preds1 == preds2)
+        print(f"\n[Agreement] Model1 vs Model2: {agreement:.4f} ({int(np.sum(preds1 == preds2))}/{len(preds1)})")
+
+        n_show = min(args.top, len(combined))
+        if n_show > 0:
+            print(f"\n[Sample Predictions] First {n_show} rows")
+            for i in range(n_show):
+                ctx = ""
+                if live_preview is not None and not live_preview.empty:
+                    row = live_preview.iloc[i].to_dict()
+                    src_ip = row.get("src_ip", "?")
+                    dst_ip = row.get("dst_ip", "?")
+                    src_port = row.get("src_port", "?")
+                    dst_port = row.get("dst_port", "?")
+                    proto = row.get("protocol", "?")
+                    ctx = f"{src_ip}:{src_port} -> {dst_ip}:{dst_port} proto={proto}"
+                print(
+                    f"  Row {i}: M1={int(preds1[i])}, M2={int(preds2[i])}, Fused={int(combined[i])}"
+                    + (f" | {ctx}" if ctx else "")
+                )
+
+        print("=" * 70)
+        return
 
     print("\n" + "="*70)
     print(f"RESULTS (Fusion Strategy: {args.strategy})")
